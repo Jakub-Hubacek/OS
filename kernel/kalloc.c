@@ -9,33 +9,41 @@
 #include "riscv.h"
 #include "defs.h"
 
+#define LOCK_NAME_N 6
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
-struct run {
+struct run
+{
   struct run *next;
 };
 
-struct {
-  struct spinlock lock;
-  struct run *freelist;
-} kmem;
-
-void
-kinit()
+struct
 {
-  initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  struct spinlock lock;
+  char lock_name[LOCK_NAME_N];
+  struct run *freelist;
+} kmem[NCPU];
+
+void kinit()
+{
+  for (int i = 0; i < NCPU; i++)
+  {
+    strncpy(kmem[i].lock_name, "kmem", LOCK_NAME_N - 1);
+    kmem[i].lock_name[LOCK_NAME_N - 1] = '\0'; // Null-terminate the string
+    initlock(&kmem[i].lock, kmem[i].lock_name);
+  }
+  freerange(end, (void *)PHYSTOP);
 }
 
-void
-freerange(void *pa_start, void *pa_end)
+void freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  p = (char *)PGROUNDUP((uint64)pa_start);
+  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
     kfree(p);
 }
 
@@ -43,23 +51,25 @@ freerange(void *pa_start, void *pa_end)
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
-void
-kfree(void *pa)
+void kfree(void *pa)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
-  r = (struct run*)pa;
+  r = (struct run *)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  push_off();
+  int cpu = cpuid();
+  acquire(&kmem[cpu].lock);
+  r->next = kmem[cpu].freelist;
+  kmem[cpu].freelist = r;
+  release(&kmem[cpu].lock);
+  pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -70,13 +80,37 @@ kalloc(void)
 {
   struct run *r;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+  push_off();
+  int cpu = cpuid();
+  acquire(&kmem[cpu].lock);
+  r = kmem[cpu].freelist;
+  if (r)
+  {
+    kmem[cpu].freelist = r->next;
+    release(&kmem[cpu].lock);
+  }
+  else
+  {
+    release(&kmem[cpu].lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+    for (int nextid = 0; nextid < NCPU; nextid++)
+    {
+      if (cpu != nextid)
+      {
+        acquire(&kmem[nextid].lock);
+        r = kmem[nextid].freelist; 
+        if (r)
+        {
+          kmem[nextid].freelist = r->next;
+          release(&kmem[nextid].lock);
+          break;
+        }
+        release(&kmem[nextid].lock);
+      }
+    }
+  }
+  pop_off();
+  if (r)
+    memset((char *)r, 5, PGSIZE); // fill with junk
+  return (void *)r;
 }
