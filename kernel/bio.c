@@ -24,7 +24,7 @@
 
 // Add buckets
 #define NBUCKET 13
-#define HASH(x) (((uint)(x)) % NBUCKET)
+#define HASH(blockno) (((uint)(blockno)) % NBUCKET)
 
 struct
 {
@@ -58,6 +58,18 @@ void binit(void)
   }
 }
 
+void move_to_bucket(struct buf *b, uint blockno)
+{
+  int h = HASH(blockno);
+
+  b->prev->next = b->next;
+  b->next->prev = b->prev;
+  b->next = bcache.head[h].next;
+  b->prev = &bcache.head[h];
+  bcache.head[h].next->prev = b;
+  bcache.head[h].next = b;
+}
+
 // Look through buffer cache for block on device dev.
 // If not found, allocate a buffer.
 // In either case, return locked buffer.
@@ -82,55 +94,48 @@ bget(uint dev, uint blockno)
   }
 
   // Not cached.
+  release(&bcache.lock[h]); // release to aviod deadlock
   acquire(&bcache.master);
+  acquire(&bcache.lock[h]); // acquire, but search again in case of something has changed while unlocked
+  for (b = bcache.head[h].next; b != &bcache.head[h]; b = b->next)
+  {
+    if (b->dev == dev && b->blockno == blockno)
+    {
+      b->refcnt++;
+      release(&bcache.lock[h]);
+      release(&bcache.master); // if found release master lock too
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+
 
   for (b = bcache.buf; b != bcache.buf + NBUF; b++)
   {
     // find free buff
     int current_h = HASH(b->blockno);
     // find free buff in your own hash
-    if (current_h == h)
-    {
-      if (b->refcnt == 0)
-      {
-        b->dev = dev;
-        b->blockno = blockno;
-        b->valid = 0;
-        b->refcnt = 1;
+    if (current_h != h)
+      acquire(&bcache.lock[current_h]);
 
-        release(&bcache.master);
-        release(&bcache.lock[h]);
-        acquiresleep(&b->lock);
-        return b;
-      }
-      continue;
-    }
-    // find free buff in other buckets
-    acquire(&bcache.lock[current_h]);
-    if (b->refcnt == 0) {
+    if (b->refcnt == 0)
+    {
       b->dev = dev;
+      if (h != current_h){
+        move_to_bucket(b, blockno);
+        release(&bcache.lock[current_h]);
+      }
       b->blockno = blockno;
       b->valid = 0;
       b->refcnt = 1;
-
-      // insert found buff to "h" bucket
-      b->prev->next = b->next;
-      b->next->prev = b->prev;
-      b->next = bcache.head[h].next;
-      b->prev = &bcache.head[h];
-      bcache.head[h].next->prev = b;
-      bcache.head[h].next = b;
-
-      release(&bcache.lock[current_h]);
       release(&bcache.lock[h]);
       release(&bcache.master);
       acquiresleep(&b->lock);
       return b;
     }
-    release(&bcache.lock[current_h]);
+    if (current_h != h)
+      release(&bcache.lock[current_h]);
   }
-  release(&bcache.master);
-  release(&bcache.lock[h]);
   panic("bget: no buffers");
 }
 
@@ -171,7 +176,6 @@ void brelse(struct buf *b)
   b->refcnt--;
   release(&bcache.lock[h]);
 }
-
 
 void bpin(struct buf *b)
 {
